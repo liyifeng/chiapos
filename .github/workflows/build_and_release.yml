@@ -1,0 +1,157 @@
+name: Build and Test C++
+
+on:
+  push:
+    branches:
+      - main
+  release:
+    types: [published]
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}--${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/long_lived/')) && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Collect coverage data
+        run: |
+          sudo apt-get update
+          sudo apt-get install lcov -y
+          cmake -B ../build -DCMAKE_BUILD_TYPE=Debug -DWITH_COVERAGE=1
+          cmake --build ../build -- -j 6
+          ../build/RunTests
+          lcov --directory ../build --capture --output-file lcov.info
+          lcov --remove lcov.info '*_deps/*' '/usr/*' --output-file lcov.info
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
+        if: always()
+        env:
+          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+        with:
+          path-to-lcov: "./lcov.info"
+
+  valgrind:
+    name: valgrind ubuntu
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: cmake, RunTests, and valgrind on ubuntu-20.04
+        run: |
+          sudo apt update
+          sudo apt-get install valgrind -y
+          mkdir build
+          cd build
+          cmake ../
+          cmake --build . -- -j 6
+
+      - name: Package linux build artifacts
+        run: |
+          if [ -d build ]; then
+            tar -czf linux-build.tar.gz -C build .
+          elif [ -d ./build ]; then
+            tar -czf linux-build.tar.gz -C ./build .
+          else
+            # try typical out-of-source build path used above
+            tar -czf linux-build.tar.gz -C . build || true
+          fi
+        working-directory: ${{ github.workspace }}
+
+      - name: Upload linux build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: linux-build.tar.gz
+
+  windows:
+    name: Windows Latest
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: cmake, RunTests with Windows
+        run: |
+          mkdir build-win
+          cd build-win
+          cmake ..
+          cmake --build . --config Release -j 6
+          ctest -C Release -j 6
+
+      - name: Package windows build artifacts
+        run: |
+          powershell -Command "
+            Set-Location '${{ github.workspace }}';
+            if (Test-Path 'build-win') {
+              Compress-Archive -Path 'build-win\\*' -DestinationPath 'windows-build.zip' -Force
+            } else {
+              Write-Host 'build-win not found'
+            }
+          "
+
+      - name: Upload windows build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: windows-build.zip
+
+  publish_release_assets:
+    name: Publish build artifacts to GitHub Release
+    # only run this job when the workflow is triggered by a published release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-22.04
+    needs:
+      - valgrind
+      - windows
+    steps:
+      - name: Checkout (needed for workspace)
+        uses: actions/checkout@v5
+
+      - name: Download linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-build
+          path: ./artifacts/linux
+
+      - name: Download windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+          path: ./artifacts/windows
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Linux artifacts:"
+          ls -al ./artifacts/linux || true
+          echo "Windows artifacts:"
+          ls -al ./artifacts/windows || true
+
+      - name: Upload assets to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_URL: ${{ github.event.release.upload_url }}
+        run: |
+          set -e
+          # upload all files found under artifacts/linux and artifacts/windows
+          for f in $(find ./artifacts -type f); do
+            fname=$(basename "$f")
+            echo "Uploading $f as $fname to release..."
+            # upload_url contains the template {?name,label} so we can append ?name=
+            curl --fail -sS -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" \
+              "${UPLOAD_URL}?name=${fname}"
+            echo "Uploaded $fname"
+          done
