@@ -1,10 +1,26 @@
 name: CI (Ubuntu build)
 
+# 触发器：push 到 main、push tag（v*.*.*）、PR、以及手动触发（可选择创建 release）
 on:
   push:
     branches: [ main ]
+    tags: ['v*.*.*']
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: '如果要在构建后创建 release，请设为 true'
+        required: false
+        default: 'false'
+      release_tag:
+        description: '（可选）用于 release 的 tag 名称，例如 v1.2.3；如果为空且是 tag push，则使用被 push 的 tag'
+        required: false
+        default: ''
+
+# 需要 write 权限才能创建 release / 上传资产
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -24,7 +40,6 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential cmake pkg-config python3 python3-pip python3-venv git ccache
-        # optional common libs - enable if your project needs them
         sudo apt-get install -y libssl-dev libbz2-dev liblzma-dev libsqlite3-dev
 
     - name: Cache ccache
@@ -73,3 +88,35 @@ jobs:
       with:
         name: chiapos-build-${{ matrix.compiler }}
         path: ${{ env.BUILD_DIR }}
+
+  # release job：仅在推 tag 或手动触发并选择 create_release=true 时执行
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+    steps:
+    - name: Download all build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Determine release tag
+      id: tag
+      run: |
+        # 优先使用 workflow_dispatch 输入的 release_tag（如果有），否则使用被 push 的 tag（github.ref_name）
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.release_tag }}" != "" ]; then
+          echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+        elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+        else
+          # fallback: 使用 run id 生成一个临时 tag 名称（不会实际在 git 中创建该 tag）
+          echo "RELEASE_TAG=build-${GITHUB_RUN_ID}" >> $GITHUB_ENV
+        fi
+        echo "Using release tag: $RELEASE_TAG"
+
+    - name: Create Release and upload assets
+      # 这个 action 会创建 release（如果不存在）并上传指定路径下的所有文件
+      uses: ncipollo/release-action@v1
+      with:
+        tag: ${{ env.RELEASE_TAG }}
+        files: artifacts/**
