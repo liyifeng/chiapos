@@ -119,3 +119,46 @@ jobs:
           cmake ..
           cmake --build . --config Release -j 6
           ctest -C Release -j 6
+
+      - name: Upload ProofOfSpace.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProofOfSpace-Windows
+          path: build-win/Release/ProofOfSpace.exe
+          if-no-files-found: error
+
+  release:
+    name: Create Release with ProofOfSpace.exe
+    runs-on: ubuntu-latest
+    needs: windows
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    permissions:
+      contents: write
+    steps:
+      - name: Download ProofOfSpace.exe artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProofOfSpace-Windows
+          path: ./artifacts
+
+      - name: Generate timestamp tag
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
+          echo "tag=v${TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "Release tag: v${TIMESTAMP}"
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.timestamp.outputs.tag }}
+          name: ProofOfSpace Build ${{ steps.timestamp.outputs.tag }}
+          body: |
+            Automated build of ProofOfSpace
+            - Build from commit: ${{ github.sha }}
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          draft: false
+          prerelease: false
+          files: |
+            ./artifacts/ProofOfSpace.exe
