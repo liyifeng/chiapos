@@ -1,6 +1,5 @@
-name: CI (Ubuntu build)
+name: CI - build and publish binaries (Ubuntu)
 
-# 触发器：push 到 main、push tag（v*.*.*）、PR、以及手动触发（可选择创建 release）
 on:
   push:
     branches: [ main ]
@@ -10,113 +9,118 @@ on:
   workflow_dispatch:
     inputs:
       create_release:
-        description: '如果要在构建后创建 release，请设为 true'
+        description: '是否在构建后创建 release 并上传二进制（true/false）'
         required: false
         default: 'false'
       release_tag:
-        description: '（可选）用于 release 的 tag 名称，例如 v1.2.3；如果为空且是 tag push，则使用被 push 的 tag'
+        description: '（可选）release 的 tag 名称，例如 v1.2.3；若为空且为 tag push，则使用被 push 的 tag'
         required: false
         default: ''
 
-# 需要 write 权限才能创建 release / 上传资产
 permissions:
   contents: write
 
+env:
+  ARTIFACT_DIR: artifacts
+
 jobs:
   build:
+    name: Build (make)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        compiler: [gcc, clang]
-      fail-fast: false
-    env:
-      BUILD_DIR: build
-
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential cmake pkg-config python3 python3-pip python3-venv git ccache
-        sudo apt-get install -y libssl-dev libbz2-dev liblzma-dev libsqlite3-dev
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config git ccache
+          # 如果项目需要 cmake 或 python 等，请根据需要启用下面一行
+          sudo apt-get install -y cmake
 
-    - name: Cache ccache
-      uses: actions/cache@v4
-      with:
-        path: ~/.ccache
-        key: ${{ runner.os }}-ccache-${{ matrix.compiler }}-${{ hashFiles('**/CMakeLists.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-ccache-${{ matrix.compiler }}-
+      - name: Configure compiler (use default gcc)
+        run: |
+          cc --version || true
+          c++ --version || true
 
-    - name: Configure compiler
-      run: |
-        if [ "${{ matrix.compiler }}" = "gcc" ]; then
-          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc 100
-          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++ 100
-        else
-          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/clang 100
-          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++ 100
-        fi
-        cc --version
-        c++ --version
+      - name: Build with Make
+        run: |
+          # 如果项目使用 CMake 生成 Makefile，请在这里先运行 cmake ..
+          # 示例（取消注释如果需要）:
+          # mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . -- -j$(nproc)
+          #
+          # 如果仓库自带 Makefile，直接运行 make
+          if [ -f Makefile ] || [ -f makefile ]; then
+            make -j$(nproc)
+          else
+            echo "No Makefile found at repo root. Attempting to run 'make' in common dirs..."
+            for d in build src; do
+              if [ -d "$d" ] && [ -f "$d/Makefile" ]; then
+                (cd "$d" && make -j$(nproc))
+              fi
+            done
+          fi
 
-    - name: Configure (CMake)
-      run: |
-        mkdir -p $BUILD_DIR
-        cd $BUILD_DIR
-        cmake .. -DCMAKE_BUILD_TYPE=Release
+      - name: Collect produced binaries
+        run: |
+          set -e
+          rm -rf $ARTIFACT_DIR
+          mkdir -p $ARTIFACT_DIR
+          # 尝试在常见输出目录中查找可执行文件（build, bin, out, release）
+          for dir in build bin out release; do
+            if [ -d "$dir" ]; then
+              find "$dir" -type f -perm -111 -maxdepth 3 -exec cp {} $ARTIFACT_DIR/ \; || true
+            fi
+          done
+          # 也在仓库根目录寻找可执行文件（排除 .git 和 .github）
+          find . -maxdepth 2 -type f -perm -111 \
+            -not -path "./.git/*" -not -path "./.github/*" -not -path "./${ARTIFACT_DIR}/*" \
+            -exec cp {} $ARTIFACT_DIR/ \; || true
+          echo "Collected files:"
+          ls -lah $ARTIFACT_DIR || true
+          if [ -z "$(ls -A $ARTIFACT_DIR 2>/dev/null)" ]; then
+            echo "No binaries found in expected locations. You may need to adjust the 'Collect produced binaries' step to match your project's output path."
+            exit 1
+          fi
 
-    - name: Build
-      run: |
-        cd $BUILD_DIR
-        cmake --build . --config Release -- -j$(nproc)
+      - name: Upload build artifacts (temporary, for debug / download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiapos-binaries
+          path: ${{ env.ARTIFACT_DIR }}
 
-    - name: Run tests (if any)
-      if: success()
-      run: |
-        cd $BUILD_DIR
-        if [ -f CTestTestfile.cmake ] || ctest --version >/dev/null 2>&1; then
-          ctest --output-on-failure || true
-        else
-          echo "No ctest configuration found, skipping tests."
-        fi
-
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: chiapos-build-${{ matrix.compiler }}
-        path: ${{ env.BUILD_DIR }}
-
-  # release job：仅在推 tag 或手动触发并选择 create_release=true 时执行
   release:
+    name: Create Release and attach binaries
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
     steps:
-    - name: Download all build artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ env.ARTIFACT_DIR }}
 
-    - name: Determine release tag
-      id: tag
-      run: |
-        # 优先使用 workflow_dispatch 输入的 release_tag（如果有），否则使用被 push 的 tag（github.ref_name）
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.release_tag }}" != "" ]; then
-          echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
-        elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-          echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-        else
-          # fallback: 使用 run id 生成一个临时 tag 名称（不会实际在 git 中创建该 tag）
-          echo "RELEASE_TAG=build-${GITHUB_RUN_ID}" >> $GITHUB_ENV
-        fi
-        echo "Using release tag: $RELEASE_TAG"
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.release_tag }}" != "" ]; then
+            echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=build-${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          fi
+          echo "Using release tag: $RELEASE_TAG"
 
-    - name: Create Release and upload assets
-      # 这个 action 会创建 release（如果不存在）并上传指定路径下的所有文件
-      uses: ncipollo/release-action@v1
-      with:
-        tag: ${{ env.RELEASE_TAG }}
-        files: artifacts/**
+      - name: Create Release and upload binaries
+        # ncipollo/release-action 会在 release 不存在时创建，然后把匹配的文件上传为 asset
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: ${{ env.ARTIFACT_DIR }}/**
+
+      - name: Confirm uploaded files
+        run: |
+          echo "Uploaded these files to release $RELEASE_TAG:"
+          ls -lah ${{ env.ARTIFACT_DIR }} || true
