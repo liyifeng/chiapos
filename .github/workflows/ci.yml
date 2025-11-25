@@ -1,0 +1,126 @@
+name: CI - build and publish binaries (Ubuntu)
+
+on:
+  push:
+    branches: [ main ]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: '是否在构建后创建 release 并上传二进制（true/false）'
+        required: false
+        default: 'false'
+      release_tag:
+        description: '（可选）release 的 tag 名称，例如 v1.2.3；若为空且为 tag push，则使用被 push 的 tag'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  ARTIFACT_DIR: artifacts
+
+jobs:
+  build:
+    name: Build (make)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config git ccache
+          # 如果项目需要 cmake 或 python 等，请根据需要启用下面一行
+          sudo apt-get install -y cmake
+
+      - name: Configure compiler (use default gcc)
+        run: |
+          cc --version || true
+          c++ --version || true
+
+      - name: Build with Make
+        run: |
+          # 如果项目使用 CMake 生成 Makefile，请在这里先运行 cmake ..
+          # 示例（取消注释如果需要）:
+          # mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . -- -j$(nproc)
+          #
+          # 如果仓库自带 Makefile，直接运行 make
+          if [ -f Makefile ] || [ -f makefile ]; then
+            make -j$(nproc)
+          else
+            echo "No Makefile found at repo root. Attempting to run 'make' in common dirs..."
+            for d in build src; do
+              if [ -d "$d" ] && [ -f "$d/Makefile" ]; then
+                (cd "$d" && make -j$(nproc))
+              fi
+            done
+          fi
+
+      - name: Collect produced binaries
+        run: |
+          set -e
+          rm -rf $ARTIFACT_DIR
+          mkdir -p $ARTIFACT_DIR
+          # 尝试在常见输出目录中查找可执行文件（build, bin, out, release）
+          for dir in build bin out release; do
+            if [ -d "$dir" ]; then
+              find "$dir" -type f -perm -111 -maxdepth 3 -exec cp {} $ARTIFACT_DIR/ \; || true
+            fi
+          done
+          # 也在仓库根目录寻找可执行文件（排除 .git 和 .github）
+          find . -maxdepth 2 -type f -perm -111 \
+            -not -path "./.git/*" -not -path "./.github/*" -not -path "./${ARTIFACT_DIR}/*" \
+            -exec cp {} $ARTIFACT_DIR/ \; || true
+          echo "Collected files:"
+          ls -lah $ARTIFACT_DIR || true
+          if [ -z "$(ls -A $ARTIFACT_DIR 2>/dev/null)" ]; then
+            echo "No binaries found in expected locations. You may need to adjust the 'Collect produced binaries' step to match your project's output path."
+            exit 1
+          fi
+
+      - name: Upload build artifacts (temporary, for debug / download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chiapos-binaries
+          path: ${{ env.ARTIFACT_DIR }}
+
+  release:
+    name: Create Release and attach binaries
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.release_tag }}" != "" ]; then
+            echo "RELEASE_TAG=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=build-${GITHUB_RUN_ID}" >> $GITHUB_ENV
+          fi
+          echo "Using release tag: $RELEASE_TAG"
+
+      - name: Create Release and upload binaries
+        # ncipollo/release-action 会在 release 不存在时创建，然后把匹配的文件上传为 asset
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: ${{ env.ARTIFACT_DIR }}/**
+
+      - name: Confirm uploaded files
+        run: |
+          echo "Uploaded these files to release $RELEASE_TAG:"
+          ls -lah ${{ env.ARTIFACT_DIR }} || true
